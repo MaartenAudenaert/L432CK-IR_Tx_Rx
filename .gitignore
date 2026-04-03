@@ -1,0 +1,44 @@
+# Build outputs
+build/
+MDK-ARM/L432CK_IR_TX_RX/
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+
+# Keil user-specific
+*.uvoptx
+*.uvguix.*
+*.bak
+*.dep
+*.d
+*.o
+*.lst
+*.htm
+*.map
+*.axf
+*.hex
+*.bin
+*.elf
+*.lnp
+*.sct
+*.ini
+JLinkLog.txt
+JLinkSettings.ini
+EventRecorderStub.scvd
+
+# EWARM build
+EWARM/settings/
+EWARM/Debug/
+EWARM/Release/
+
+# VS Code
+.vscode/
+
+# CubeMX backup
+*.mxproject
+
+# Documentation (not for repo)
+*.md
+
+# OS files
+Thumbs.db
+.DS_Store
