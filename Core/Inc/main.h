@@ -73,6 +73,10 @@ void Error_Handler(void);
 #define LD3_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
+#define BLE_TX_Pin GPIO_PIN_9
+#define BLE_TX_GPIO_Port GPIOA
+#define BLE_RX_Pin GPIO_PIN_10
+#define BLE_RX_GPIO_Port GPIOA
 
 /* USER CODE END Private defines */
 
