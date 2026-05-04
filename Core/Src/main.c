@@ -32,6 +32,14 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+  char player_name[17];
+  uint32_t team_color_rgb;
+  uint8_t current_hitpoints;
+  uint8_t max_hitpoints;
+  uint8_t rc5_address;
+} App_PlayerState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -42,7 +50,14 @@
 #define BLE_COMMAND_BUFFER_SIZE     96U
 #define BLE_TX_QUEUE_DEPTH          64U
 #define BLE_TX_MAX_MESSAGE_SIZE     160U
+#define UART2_TX_QUEUE_DEPTH        64U
+#define UART2_TX_MAX_MESSAGE_SIZE   160U
 #define BLE_STARTUP_BANNER_DELAY_MS 750U
+#define APP_PLAYER_NAME_MAX_LENGTH  16U
+#define APP_DEFAULT_PLAYER_NAME     "Player 1"
+#define APP_DEFAULT_TEAM_COLOR      0x1F4EFFUL
+#define APP_DEFAULT_MAX_HITPOINTS   5U
+#define HUD_PREFIX                  "HUD:"
 
 /* USER CODE END PD */
 
@@ -60,6 +75,7 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart1_tx;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
 static uint8_t toggle_bit = 0U;
@@ -82,6 +98,13 @@ static volatile uint8_t ble_tx_queue_count = 0U;
 static char ble_tx_queue[BLE_TX_QUEUE_DEPTH][BLE_TX_MAX_MESSAGE_SIZE];
 static uint16_t ble_tx_lengths[BLE_TX_QUEUE_DEPTH];
 static uint8_t ble_startup_banner_sent = 0U;
+static App_PlayerState_t player_state;
+static volatile uint8_t uart2_tx_busy = 0U;
+static volatile uint8_t uart2_tx_queue_head = 0U;
+static volatile uint8_t uart2_tx_queue_tail = 0U;
+static volatile uint8_t uart2_tx_queue_count = 0U;
+static char uart2_tx_queue[UART2_TX_QUEUE_DEPTH][UART2_TX_MAX_MESSAGE_SIZE];
+static uint16_t uart2_tx_lengths[UART2_TX_QUEUE_DEPTH];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,11 +118,16 @@ static void MX_TIM16_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void App_SendDebug(const char *format, ...);
+static void App_InitPlayerState(void);
 static void App_BlinkStatusLed(uint32_t duration_ms);
 static void App_ProcessStatusLed(void);
 static void App_RegisterHit(uint8_t address);
+static uint8_t App_ConsumeHitpoint(void);
 static uint8_t App_ParseUnsignedValue(const char *text, uint32_t min_value,
                                       uint32_t max_value, uint32_t *value_out);
+static uint8_t App_TryParseTextValue(const char *line, const char *prefix,
+                                     char *value_out, size_t value_out_size);
+static uint8_t App_ParseColorValue(const char *text, uint32_t *color_out);
 static void Ble_StartReception(void);
 static void Ble_ProcessRxDma(void);
 static void Ble_ProcessRxChunk(const uint8_t *data, uint16_t length);
@@ -117,6 +145,13 @@ static void Ble_QueueBytes(const uint8_t *data, uint16_t length);
 static void Ble_KickTx(void);
 static void Ble_SendStartupBanner(void);
 static void Ble_ServiceStartupBanner(void);
+static void Uart2_QueueBytes(const uint8_t *data, uint16_t length);
+static void Uart2_QueueFormatted(const char *format, ...);
+static void Uart2_KickTx(void);
+static void Hud_SendNameUpdate(void);
+static void Hud_SendColorUpdate(void);
+static void Hud_SendHitpointUpdate(void);
+static void Hud_SendFullState(void);
 
 /* USER CODE END PFP */
 
@@ -124,7 +159,7 @@ static void Ble_ServiceStartupBanner(void);
 /* USER CODE BEGIN 0 */
 static void App_SendDebug(const char *format, ...)
 {
-  char buffer[BLE_TX_MAX_MESSAGE_SIZE];
+  char buffer[UART2_TX_MAX_MESSAGE_SIZE];
   va_list args;
   int length;
 
@@ -142,7 +177,17 @@ static void App_SendDebug(const char *format, ...)
     length = (int)sizeof(buffer) - 1;
   }
 
-  HAL_UART_Transmit(&huart2, (uint8_t *)buffer, (uint16_t)length, 100);
+  Uart2_QueueBytes((const uint8_t *)buffer, (uint16_t)length);
+}
+
+static void App_InitPlayerState(void)
+{
+  strncpy(player_state.player_name, APP_DEFAULT_PLAYER_NAME, APP_PLAYER_NAME_MAX_LENGTH);
+  player_state.player_name[APP_PLAYER_NAME_MAX_LENGTH] = '\0';
+  player_state.team_color_rgb = APP_DEFAULT_TEAM_COLOR;
+  player_state.max_hitpoints = APP_DEFAULT_MAX_HITPOINTS;
+  player_state.current_hitpoints = APP_DEFAULT_MAX_HITPOINTS;
+  player_state.rc5_address = tx_address;
 }
 
 static void App_BlinkStatusLed(uint32_t duration_ms)
@@ -170,6 +215,18 @@ static void App_RegisterHit(uint8_t address)
   }
 }
 
+static uint8_t App_ConsumeHitpoint(void)
+{
+  if (player_state.current_hitpoints == 0U)
+  {
+    return 0U;
+  }
+
+  player_state.current_hitpoints--;
+  Hud_SendHitpointUpdate();
+  return 1U;
+}
+
 static uint8_t App_ParseUnsignedValue(const char *text, uint32_t min_value,
                                       uint32_t max_value, uint32_t *value_out)
 {
@@ -188,6 +245,86 @@ static uint8_t App_ParseUnsignedValue(const char *text, uint32_t min_value,
   }
 
   *value_out = (uint32_t)parsed_value;
+  return 1U;
+}
+
+static uint8_t App_TryParseTextValue(const char *line, const char *prefix,
+                                     char *value_out, size_t value_out_size)
+{
+  const char *value_text;
+  size_t prefix_length;
+  size_t value_length;
+
+  if ((line == NULL) || (prefix == NULL) || (value_out == NULL) || (value_out_size < 2U))
+  {
+    return 0U;
+  }
+
+  prefix_length = strlen(prefix);
+  if (strncmp(line, prefix, prefix_length) != 0)
+  {
+    return 0U;
+  }
+
+  value_text = line + prefix_length;
+  while (*value_text == ' ')
+  {
+    value_text++;
+  }
+
+  value_length = strlen(value_text);
+  while ((value_length > 0U) && (value_text[value_length - 1U] == ' '))
+  {
+    value_length--;
+  }
+
+  if ((value_length >= 2U) && (value_text[0] == '"') && (value_text[value_length - 1U] == '"'))
+  {
+    value_text++;
+    value_length -= 2U;
+  }
+
+  if ((value_length == 0U) || (value_length >= value_out_size))
+  {
+    return 0U;
+  }
+
+  memcpy(value_out, value_text, value_length);
+  value_out[value_length] = '\0';
+  return 1U;
+}
+
+static uint8_t App_ParseColorValue(const char *text, uint32_t *color_out)
+{
+  char *end_ptr;
+  unsigned long parsed_value;
+
+  if ((text == NULL) || (*text == '\0') || (color_out == NULL))
+  {
+    return 0U;
+  }
+
+  if (*text == '#')
+  {
+    text++;
+    if (*text == '\0')
+    {
+      return 0U;
+    }
+
+    parsed_value = strtoul(text, &end_ptr, 16);
+  }
+  else
+  {
+    parsed_value = strtoul(text, &end_ptr, 0);
+  }
+
+  if ((*end_ptr != '\0') || (parsed_value > 0xFFFFFFUL))
+  {
+    return 0U;
+  }
+
+  *color_out = (uint32_t)parsed_value;
   return 1U;
 }
 
@@ -361,6 +498,8 @@ static void Ble_ResetHits(void)
 {
   memset(hit_count_by_address, 0, sizeof(hit_count_by_address));
   total_hits = 0U;
+  player_state.current_hitpoints = player_state.max_hitpoints;
+  Hud_SendHitpointUpdate();
   Ble_AppQueueString("OK: hit counters reset\r\n");
 }
 
@@ -377,6 +516,7 @@ static void Ble_ProcessLine(const char *line)
 static void Ble_ProcessAppCommand(const char *line)
 {
   uint32_t new_value;
+  char text_value[APP_PLAYER_NAME_MAX_LENGTH + 8U];
 
   if ((line == NULL) || (*line == '\0'))
   {
@@ -393,6 +533,7 @@ static void Ble_ProcessAppCommand(const char *line)
                                     &new_value) != 0U)
   {
     tx_address = (uint8_t)new_value;
+    player_state.rc5_address = tx_address;
     Ble_AppQueueFormatted("OK: address set to %u (0x%02X)\r\n", tx_address, tx_address);
   }
   else if (strncmp(line, "set_address:", 12) == 0)
@@ -415,6 +556,46 @@ static void Ble_ProcessAppCommand(const char *line)
   else if (strcmp(line, "reset_hits") == 0)
   {
     Ble_ResetHits();
+  }
+  else if (App_TryParseTextValue(line, "set_name:", text_value, sizeof(text_value)) != 0U)
+  {
+    strncpy(player_state.player_name, text_value, APP_PLAYER_NAME_MAX_LENGTH);
+    player_state.player_name[APP_PLAYER_NAME_MAX_LENGTH] = '\0';
+    Hud_SendNameUpdate();
+    Ble_AppQueueFormatted("OK: player name set to \"%s\"\r\n", player_state.player_name);
+  }
+  else if (strncmp(line, "set_name:", 9) == 0)
+  {
+    Ble_AppQueueFormatted("ERROR: name must be 1..%u visible characters\r\n",
+                          APP_PLAYER_NAME_MAX_LENGTH);
+  }
+  else if (App_TryParseTextValue(line, "set_color:", text_value, sizeof(text_value)) != 0U)
+  {
+    if (App_ParseColorValue(text_value, &new_value) != 0U)
+    {
+      player_state.team_color_rgb = new_value;
+      Hud_SendColorUpdate();
+      Ble_AppQueueFormatted("OK: team color set to #%06lX\r\n",
+                            (unsigned long)player_state.team_color_rgb);
+    }
+    else
+    {
+      Ble_AppQueueString("ERROR: color must be #RRGGBB, 0xRRGGBB or decimal\r\n");
+    }
+  }
+  else if (strncmp(line, "set_color:", 10) == 0)
+  {
+    Ble_AppQueueString("ERROR: color must be #RRGGBB, 0xRRGGBB or decimal\r\n");
+  }
+  else if (strcmp(line, "simulate_hit") == 0)
+  {
+    App_RegisterHit(player_state.rc5_address);
+    (void)App_ConsumeHitpoint();
+    Ble_AppQueueFormatted("OK: simulated hit processed, hp=%u/%u\r\n",
+                          player_state.current_hitpoints, player_state.max_hitpoints);
+    App_SendDebug("[SIM] HP %u/%u on address 0x%02X\r\n",
+                  player_state.current_hitpoints, player_state.max_hitpoints,
+                  player_state.rc5_address);
   }
   else
   {
@@ -524,7 +705,7 @@ static void Ble_SendStartupBanner(void)
 {
   Ble_AppQueueString("Hello BLE\r\n");
   Ble_AppQueueString("[BOOT] BLE command interface ready\r\n");
-  Ble_AppQueueString("Commands: current_settings, set_address:\"x\", set_command:\"x\", current_hits, reset_hits\r\n");
+  Ble_AppQueueString("Commands: current_settings, set_address:\"x\", set_command:\"x\", current_hits, reset_hits, set_name:\"text\", set_color:\"#RRGGBB\", simulate_hit\r\n");
 }
 
 static void Ble_ServiceStartupBanner(void)
@@ -541,6 +722,115 @@ static void Ble_ServiceStartupBanner(void)
 
   Ble_SendStartupBanner();
   ble_startup_banner_sent = 1U;
+}
+
+static void Uart2_QueueBytes(const uint8_t *data, uint16_t length)
+{
+  uint8_t slot;
+
+  if ((data == NULL) || (length == 0U))
+  {
+    return;
+  }
+
+  if (length >= UART2_TX_MAX_MESSAGE_SIZE)
+  {
+    length = UART2_TX_MAX_MESSAGE_SIZE - 1U;
+  }
+
+  __disable_irq();
+  if (uart2_tx_queue_count >= UART2_TX_QUEUE_DEPTH)
+  {
+    __enable_irq();
+    return;
+  }
+
+  slot = uart2_tx_queue_tail;
+  memcpy(uart2_tx_queue[slot], data, length);
+  uart2_tx_queue[slot][length] = '\0';
+  uart2_tx_lengths[slot] = length;
+  uart2_tx_queue_tail = (uint8_t)((uart2_tx_queue_tail + 1U) % UART2_TX_QUEUE_DEPTH);
+  uart2_tx_queue_count++;
+  __enable_irq();
+
+  Uart2_KickTx();
+}
+
+static void Uart2_QueueFormatted(const char *format, ...)
+{
+  char buffer[UART2_TX_MAX_MESSAGE_SIZE];
+  va_list args;
+  int length;
+
+  va_start(args, format);
+  length = vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  if (length <= 0)
+  {
+    return;
+  }
+
+  if (length >= (int)sizeof(buffer))
+  {
+    length = (int)sizeof(buffer) - 1;
+  }
+
+  Uart2_QueueBytes((const uint8_t *)buffer, (uint16_t)length);
+}
+
+static void Uart2_KickTx(void)
+{
+  uint8_t slot;
+  uint8_t should_start = 0U;
+
+  __disable_irq();
+  if ((uart2_tx_busy == 0U) && (uart2_tx_queue_count > 0U))
+  {
+    slot = uart2_tx_queue_head;
+    uart2_tx_busy = 1U;
+    should_start = 1U;
+  }
+  else
+  {
+    slot = 0U;
+  }
+  __enable_irq();
+
+  if (should_start != 0U)
+  {
+    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)uart2_tx_queue[slot],
+                              uart2_tx_lengths[slot]) != HAL_OK)
+    {
+      __disable_irq();
+      uart2_tx_busy = 0U;
+      __enable_irq();
+    }
+  }
+}
+
+static void Hud_SendNameUpdate(void)
+{
+  Uart2_QueueFormatted(HUD_PREFIX "NAME:%s\r\n", player_state.player_name);
+}
+
+static void Hud_SendColorUpdate(void)
+{
+  Uart2_QueueFormatted(HUD_PREFIX "COLOR:#%06lX\r\n",
+                       (unsigned long)player_state.team_color_rgb);
+}
+
+static void Hud_SendHitpointUpdate(void)
+{
+  Uart2_QueueFormatted(HUD_PREFIX "HP:%u/%u\r\n",
+                       player_state.current_hitpoints, player_state.max_hitpoints);
+}
+
+static void Hud_SendFullState(void)
+{
+  Hud_SendNameUpdate();
+  Hud_SendColorUpdate();
+  Hud_SendHitpointUpdate();
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -572,6 +862,19 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     __enable_irq();
 
     Ble_KickTx();
+  }
+  else if (huart->Instance == USART2)
+  {
+    __disable_irq();
+    if (uart2_tx_queue_count > 0U)
+    {
+      uart2_tx_queue_head = (uint8_t)((uart2_tx_queue_head + 1U) % UART2_TX_QUEUE_DEPTH);
+      uart2_tx_queue_count--;
+    }
+    uart2_tx_busy = 0U;
+    __enable_irq();
+
+    Uart2_KickTx();
   }
 }
 
@@ -624,10 +927,13 @@ int main(void)
   /* USER CODE BEGIN 2 */
   IR_Transceiver_Init();
   Ble_StartReception();
+  App_InitPlayerState();
 
   App_SendDebug("\r\n[BOOT] IR TX/RX ready on USART2 (115200-8N1)\r\n");
   App_SendDebug("[BOOT] USART1 linked to LilyGO BLE bridge with DMA RX circular + DMA TX\r\n");
   App_SendDebug("[BOOT] Transparent BLE-UART mode active on USART1\r\n");
+  App_SendDebug("[BOOT] HUD updates share USART2 via DMA with prefix %s\r\n", HUD_PREFIX);
+  Hud_SendFullState();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -655,15 +961,15 @@ int main(void)
       {
         toggle_bit = next_toggle;
         App_RegisterHit(tx_address);
+        (void)App_ConsumeHitpoint();
 
         App_SendDebug("[TX] Addr:0x%02X Cmd:0x%02X Tog:%u\r\n",
                       tx_address, tx_command, toggle_bit);
-        Ble_AppQueueFormatted("[TX] Addr:0x%02X Cmd:0x%02X Tog:%u\r\n",
-                              tx_address, tx_command, toggle_bit);
         App_SendDebug("[SELF-TEST] address 0x%02X hits:%lu\r\n",
                       tx_address, (unsigned long)hit_count_by_address[tx_address]);
-        Ble_AppQueueFormatted("[SELF-TEST] address 0x%02X hits:%lu\r\n",
-                              tx_address, (unsigned long)hit_count_by_address[tx_address]);
+        App_SendDebug("[HUD] Self-test -> HP %u/%u\r\n",
+                      player_state.current_hitpoints,
+                      player_state.max_hitpoints);
       }
       else
       {
@@ -680,9 +986,15 @@ int main(void)
       App_SendDebug("[RX] Addr:0x%02X Cmd:0x%02X Tog:%u Hits:%lu\r\n",
                     RC5_FRAME.Address, RC5_FRAME.Command, RC5_FRAME.ToggleBit,
                     (unsigned long)hit_count_by_address[RC5_FRAME.Address]);
-      Ble_AppQueueFormatted("[RX] Addr:0x%02X Cmd:0x%02X Tog:%u Hits:%lu\r\n",
-                            RC5_FRAME.Address, RC5_FRAME.Command, RC5_FRAME.ToggleBit,
-                            (unsigned long)hit_count_by_address[RC5_FRAME.Address]);
+
+      if (RC5_FRAME.Address == player_state.rc5_address)
+      {
+        (void)App_ConsumeHitpoint();
+        App_SendDebug("[HUD] Own hit on address 0x%02X -> HP %u/%u\r\n",
+                      player_state.rc5_address,
+                      player_state.current_hitpoints,
+                      player_state.max_hitpoints);
+      }
 
       App_BlinkStatusLed(100U);
     }
@@ -1020,6 +1332,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 4, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+  /* DMA1_Channel7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 4, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
 }
 
